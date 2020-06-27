@@ -6,7 +6,7 @@
 .idea/
 .class
 target/
-.iml
+*.iml
 
 # Log file
 *.log

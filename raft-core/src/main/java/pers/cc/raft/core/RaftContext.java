@@ -1,6 +1,5 @@
 package pers.cc.raft.core;
 
-import com.google.common.util.concurrent.ListenableFuture;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import io.grpc.stub.StreamObserver;
 import lombok.Data;
@@ -8,11 +7,12 @@ import lombok.extern.slf4j.Slf4j;
 import pers.cc.raft.core.peer.Endpoint;
 import pers.cc.raft.core.peer.Peer;
 import pers.cc.raft.core.peer.Server;
-import pers.cc.raft.core.util.ServerUtil;
+import pers.cc.raft.core.service.impl.RaftServerServiceImpl;
 import pers.cc.raft.core.util.StringUtil;
 import pers.raft.proto.RaftProto;
 import pers.raft.proto.RaftServiceGrpc;
 
+import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.Lock;
@@ -28,7 +28,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public class RaftContext {
 
     public static final int HALF = 2;
-    private Node node;
+    private Node currentnNode;
 
     private RaftConfig raftConfig;
 
@@ -41,6 +41,8 @@ public class RaftContext {
      * 心跳定时器
      */
     private ScheduledFuture heartbeatScheduledFuture;
+
+    private io.grpc.Server gRpcServer ;
 
     /**
      * 核心线程池
@@ -63,7 +65,7 @@ public class RaftContext {
         this.localServerId = localServerId;
         this.peerMap = peerMap;
         this.raftConfig = new RaftConfig();
-        this.node = new Node();
+        this.currentnNode = new Node();
         scheduledExecutorService = Executors.newScheduledThreadPool(2, r -> {
             Thread thread = new Thread(r);
             thread.setName("electionThread");
@@ -75,19 +77,44 @@ public class RaftContext {
                 60,
                 TimeUnit.SECONDS,
                 new LinkedBlockingQueue());
+        RaftContextHolder.raftContext(this);
     }
 
     public void start() {
-        // 重置选举超时时间
-        resetElectionTimer();
+        Peer peer = peerMap.get(this.localServerId);
+        Endpoint endpoint = peer.getServer().getEndpoint();
+        try {
+            gRpcServer = NettyServerBuilder.forPort(endpoint.getPort())
+                    .addService(new RaftServerServiceImpl())
+                    .build().start();
+            log.info("Server started, listening on " + endpoint.getPort());
+            // 重置选举超时时间
+            resetElectionTimer();
+        } catch (IOException e) {
+            log.error("server start error",e);
+            stop();
+            System.exit(1);
+        }
+    }
+
+    public void stop(){
+        if (!scheduledExecutorService.isShutdown()){
+            scheduledExecutorService.shutdown();
+        }
+        if (!executorService.isShutdown()){
+            executorService.shutdown();
+        }
+        if (!gRpcServer.isShutdown()){
+            gRpcServer.shutdown();
+        }
     }
 
     /**
      * 客户端发起vote请求
      */
     private void startVote() {
-        node.changeNodeState(NodeState.CANDIDATE);
-        node.setCurrentTerm(node.getCurrentTerm() + 1);
+        currentnNode.changeNodeState(NodeState.CANDIDATE);
+        currentnNode.setCurrentTerm(currentnNode.getCurrentTerm() + 1);
         votedForList = new CopyOnWriteArrayList();
         votedForList.add(true);
         Collection<Peer> peerList = peerMap.values();
@@ -102,7 +129,7 @@ public class RaftContext {
                 RaftServiceGrpc.RaftServiceStub raftServiceStub = peer.getRaftServiceStub();
                 RaftProto.VoteRequest voteRequest = RaftProto.VoteRequest.newBuilder()
                         .setCandidateId(localServerId)
-                        .setTerm(node.getCurrentTerm())
+                        .setTerm(currentnNode.getCurrentTerm())
                         .build();
                 raftServiceStub.requestVote(voteRequest, getRequestVoteCallBack());
             });
@@ -129,17 +156,19 @@ public class RaftContext {
         return new StreamObserver<RaftProto.VoteResponse>() {
             @Override
             public void onNext(RaftProto.VoteResponse voteResponse) {
-                if (!node.getNodeState().equals(NodeState.CANDIDATE)) {
+                if (!currentnNode.getNodeState().equals(NodeState.CANDIDATE)) {
+                    log.info("ignore requestVote RPC result current status {}", currentnNode.getNodeState());
                     return;
                 }
-                if (voteResponse.getTerm() > node.getCurrentTerm()) {
+                if (currentnNode.getCurrentTerm()<voteResponse.getTerm()) {
                     stepDown(voteResponse.getTerm());
                     return;
                 }
-                log.debug("接收到 {} 投票结果", voteResponse.getVoteGranted());
+                log.debug("接收到投票结果:{} term:{}", voteResponse.getVoteGranted(),voteResponse.getTerm());
                 votedForList.add(voteResponse.getVoteGranted());
                 if (votedForList.stream().filter(vr -> vr.booleanValue()).count() >= peerMap.size() / HALF) {
                     //成为leader
+                    log.info("Got majority vote, serverId={} become leader ,term is {}", localServerId, currentnNode.getCurrentTerm());
                     stepUp();
                 }
             }
@@ -169,8 +198,12 @@ public class RaftContext {
      * 如果存在一个满足N > commitIndex的 N，并且大多数的matchIndex[i] ≥ N成立，并且log[N].term == currentTerm成立，那么令 commitIndex 等于这个 N （5.3 和 5.4 节）
      */
     public void stepUp() {
-        node.setNodeState(NodeState.LEADER);
-        node.setVotedFor(StringUtil.EMPTY);
+        currentnNode.setNodeState(NodeState.LEADER);
+        currentnNode.setVotedFor(StringUtil.EMPTY);
+        currentnNode.setLeaderId(this.localServerId);
+        // stop vote timer
+        stopElectionTimer();
+        // start heartbeat timer
         startNewHeartbeat();
     }
 
@@ -180,10 +213,7 @@ public class RaftContext {
     private void startNewHeartbeat() {
         log.debug("start new heartbeat, peers={}", peerMap);
         Collection<Peer> peerList = peerMap.values();
-        peerList.forEach(peer -> {
-            Server server = peer.getServer();
-            executorService.submit(() -> appendEntries(peer));
-        });
+        peerList.forEach(peer -> executorService.submit(() -> appendEntries(peer)));
         resetHeartbeatTimer();
     }
 
@@ -192,14 +222,38 @@ public class RaftContext {
      * in lock
      */
     private void resetHeartbeatTimer() {
-        if (Objects.nonNull(heartbeatScheduledFuture) && !heartbeatScheduledFuture.isDone()) {
-            heartbeatScheduledFuture.cancel(true);
-        }
-//        scheduledExecutorService.schedule()
+        stopHeartbeat();
+        scheduledExecutorService.schedule(()->startNewHeartbeat(),raftConfig.getHeartbeatPeriodMilliseconds(),TimeUnit.MILLISECONDS);
     }
 
+    /**
+     *
+     * @param peer
+     */
     private void appendEntries(Peer peer) {
+        RaftProto.AppendEntriesRequest.Builder appendEntriesBuilder = RaftProto.AppendEntriesRequest.newBuilder();
+        appendEntriesBuilder.setLeaderId(localServerId).setTerm(currentnNode.getCurrentTerm());
 
+        peer.getRaftServiceStub().appendEntries(appendEntriesBuilder.build(),getAppendEntriesCallBack());
+    }
+
+    private StreamObserver<RaftProto.AppendEntriesResponse> getAppendEntriesCallBack(){
+        return  new StreamObserver<RaftProto.AppendEntriesResponse>() {
+            @Override
+            public void onNext(RaftProto.AppendEntriesResponse value) {
+
+            }
+
+            @Override
+            public void onError(Throwable t) {
+
+            }
+
+            @Override
+            public void onCompleted() {
+
+            }
+        };
     }
 
     /**
@@ -208,32 +262,43 @@ public class RaftContext {
      * @param newTerm
      */
     public void stepDown(long newTerm) {
-        node.setCurrentTerm(newTerm);
-        node.setLeaderId(StringUtil.EMPTY);
-        node.setVotedFor(StringUtil.EMPTY);
-        node.setNodeState(NodeState.FOLLOWER);
+        currentnNode.setCurrentTerm(newTerm);
+        currentnNode.setLeaderId(StringUtil.EMPTY);
+        currentnNode.setVotedFor(StringUtil.EMPTY);
+        currentnNode.setNodeState(NodeState.FOLLOWER);
         // stop heartbeat
+        stopHeartbeat();
+        resetElectionTimer();
+    }
+
+    private void stopHeartbeat() {
         if (heartbeatScheduledFuture != null && !heartbeatScheduledFuture.isDone()) {
             heartbeatScheduledFuture.cancel(true);
         }
-        resetElectionTimer();
     }
 
     /**
      * 选举定时器
      */
     private void resetElectionTimer() {
-        if (electionScheduledFuture != null && !electionScheduledFuture.isDone()) {
-            electionScheduledFuture.cancel(true);
-        }
+        stopElectionTimer();
         //开启随机选举
         electionScheduledFuture = scheduledExecutorService.schedule(() -> startVote(), getElectionTimeoutMs(), TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * 停止现在正在进行的选举任务
+     */
+    private void stopElectionTimer() {
+        if (electionScheduledFuture != null && !electionScheduledFuture.isDone()) {
+            electionScheduledFuture.cancel(true);
+        }
+    }
+
     private int getElectionTimeoutMs() {
         ThreadLocalRandom random = ThreadLocalRandom.current();
-        int randomElectionTimeout = raftConfig.getHeartbeatPeriodMilliseconds()
-                + random.nextInt(0, 2 * raftConfig.getHeartbeatPeriodMilliseconds());
+        int randomElectionTimeout = raftConfig.getElectionTimeoutMilliseconds()
+                + random.nextInt(0, 2 * raftConfig.getElectionTimeoutMilliseconds());
         log.debug("new election time is after {} ms", randomElectionTimeout);
         return randomElectionTimeout;
     }

@@ -32,9 +32,9 @@ public class RaftServerServiceImpl extends RaftServiceGrpc.RaftServiceImplBase {
      */
     @Override
     public void requestVote(RaftProto.VoteRequest request, StreamObserver<RaftProto.VoteResponse> responseObserver) {
-        log.debug("{}:请求投票,任期号为：{},最后提交日志任期号为：{},最后提交日志id为：{}",request.getCandidateId(),request.getTerm(),request.getLastLogTerm(),request.getLastLogIndex());
+        log.debug("接收到投票请求:{}请求投票,任期号为：{},最后提交日志任期号为：{},最后提交日志id为：{}",request.getCandidateId(),request.getTerm(),request.getLastLogTerm(),request.getLastLogIndex());
         RaftContext raftContext = RaftContextHolder.getRaftContext();
-        Node node = raftContext.getNode();
+        Node node = raftContext.getCurrentnNode();
         try {
             node.getLock().lock();
             RaftProto.VoteResponse.Builder voteResponseBuilder = RaftProto.VoteResponse.newBuilder();

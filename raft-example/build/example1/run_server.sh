@@ -29,7 +29,10 @@ JAVA_GC_OPTS=" -verbose:gc -Xloggc:$GC_LOG \
 -XX:+PrintGCDetails -XX:+PrintGCDateStamps "
 
 JAVA_OPTS=" $JAVA_BASE_OPTS $JAVA_MEM_OPTS $JAVA_JMX_OPTS $JAVA_GC_OPTS "
+
 RAFT_SERVER_JAR=raft-server-1.0-SNAPSHOT.jar
+[[ ! -f $RAFT_SERVER_JAR ]] && cp ./../target/$RAFT_SERVER_JAR .
+
 
 RUNJAVA="$JAVA_HOME/bin/java"
 JAVA_JAR=" -jar $RAFT_SERVER_JAR"
